@@ -11,7 +11,8 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 
 // ── Environment ──────────────────────────────────────────────────────────────
 const GROQ_KEY = process.env.GROQ_API_KEY;
 const PORT = process.env.PORT || 3000;
-const FREE_DAILY_LIMIT = 5; // free transcriptions per IP per day
+const FREE_DAILY_LIMIT = 7; // free transcriptions per IP per day
+const STATS_PASSWORD = process.env.STATS_PASSWORD || "nana2026"; // change this in Render env variables
 
 if (!GROQ_KEY) {
   console.error("ERROR: GROQ_API_KEY environment variable is not set.");
@@ -25,6 +26,30 @@ app.use(express.json());
 // ── Usage tracking (in-memory — resets on server restart) ───────────────────
 // For production, swap this out for Redis or a database.
 const usageMap = {}; // { "ip::date" : count }
+
+// ── Stats tracking ────────────────────────────────────────────────────────────
+const stats = {
+  totalVisits: 0,
+  totalTranscriptions: 0,
+  dailyVisits: {},       // { "2026-04-12": count }
+  dailyTranscriptions: {}, // { "2026-04-12": count }
+};
+
+function todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function recordVisit() {
+  stats.totalVisits++;
+  const d = todayStr();
+  stats.dailyVisits[d] = (stats.dailyVisits[d] || 0) + 1;
+}
+
+function recordTranscription() {
+  stats.totalTranscriptions++;
+  const d = todayStr();
+  stats.dailyTranscriptions[d] = (stats.dailyTranscriptions[d] || 0) + 1;
+}
 
 function getKey(ip) {
   const today = new Date().toISOString().slice(0, 10);
@@ -49,13 +74,48 @@ const limiter = rateLimit({
 app.use(limiter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get("/", (req, res) => res.json({ status: "French Oral Master API running 🇫🇷" }));
+app.get("/", (req, res) => {
+  recordVisit();
+  res.json({ status: "French Oral Master API running 🇫🇷" });
+});
 
 // ── Usage status ──────────────────────────────────────────────────────────────
 app.get("/usage", (req, res) => {
   const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.ip;
   const used = getUsage(ip);
   res.json({ used, limit: FREE_DAILY_LIMIT, remaining: Math.max(0, FREE_DAILY_LIMIT - used) });
+});
+
+// ── Stats endpoint (password protected — only you can see) ───────────────────
+app.get("/stats", (req, res) => {
+  const { password } = req.query;
+  if (password !== STATS_PASSWORD) {
+    return res.status(403).json({ error: "Access denied." });
+  }
+
+  const today = todayStr();
+  const last7 = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const key = d.toISOString().slice(0, 10);
+    last7.push({
+      date: key,
+      visits: stats.dailyVisits[key] || 0,
+      transcriptions: stats.dailyTranscriptions[key] || 0,
+    });
+  }
+
+  res.json({
+    "🇫🇷 French Oral Master — Your Stats": "━━━━━━━━━━━━━━━━━━━━━━━━",
+    total_visits_ever: stats.totalVisits,
+    total_transcriptions_ever: stats.totalTranscriptions,
+    today_visits: stats.dailyVisits[today] || 0,
+    today_transcriptions: stats.dailyTranscriptions[today] || 0,
+    last_7_days: last7,
+    free_limit_per_user: FREE_DAILY_LIMIT,
+    server_time: new Date().toISOString(),
+  });
 });
 
 // ── Transcribe endpoint ───────────────────────────────────────────────────────
@@ -96,6 +156,7 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
 
     const transcript = await groqRes.text();
     incrementUsage(ip);
+    recordTranscription();
 
     const used = getUsage(ip);
     res.json({
