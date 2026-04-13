@@ -15,52 +15,97 @@ const OWNER_SECRET = process.env.OWNER_SECRET || "";
 const PORT = process.env.PORT || 3000;
 const FREE_DAILY_LIMIT = 7;
 const STATS_PASSWORD = process.env.STATS_PASSWORD || "nana2026";
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
 if (!GROQ_KEY) { console.error("ERROR: GROQ_API_KEY not set."); process.exit(1); }
 if (!GEMINI_KEY) { console.error("ERROR: GEMINI_API_KEY not set."); process.exit(1); }
+if (!UPSTASH_URL || !UPSTASH_TOKEN) { console.error("ERROR: UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN not set."); process.exit(1); }
 
-console.log("✅ Server starting... GROQ_KEY present:", !!GROQ_KEY, "| GEMINI_KEY present:", !!GEMINI_KEY);
+console.log("✅ Server starting... GROQ_KEY:", !!GROQ_KEY, "| GEMINI_KEY:", !!GEMINI_KEY, "| UPSTASH:", !!UPSTASH_URL);
 
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-const usageMap = {};
-const stats = { totalVisits: 0, totalTranscriptions: 0, dailyVisits: {}, dailyTranscriptions: {} };
+// ── Upstash Redis helpers ─────────────────────────────────────────────────────
+async function redisGet(key) {
+  const res = await fetch(`${UPSTASH_URL}/get/${key}`, {
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+  });
+  const data = await res.json();
+  return data.result;
+}
+
+async function redisSet(key, value, exSeconds) {
+  const url = exSeconds
+    ? `${UPSTASH_URL}/set/${key}/${value}/ex/${exSeconds}`
+    : `${UPSTASH_URL}/set/${key}/${value}`;
+  await fetch(url, { headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
+}
+
+async function redisIncr(key, exSeconds) {
+  // Increment and set expiry atomically
+  const res = await fetch(`${UPSTASH_URL}/incr/${key}`, {
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+  });
+  const data = await res.json();
+  const newVal = data.result;
+  // Set expiry only when first created (newVal === 1)
+  if (newVal === 1 && exSeconds) {
+    await fetch(`${UPSTASH_URL}/expire/${key}/${exSeconds}`, {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+    });
+  }
+  return newVal;
+}
+
+// ── Stats tracking (still in-memory for visits, Redis for transcriptions) ─────
+const stats = { totalVisits: 0, dailyVisits: {} };
 
 function todayStr() { return new Date().toISOString().slice(0, 10); }
 function recordVisit() { stats.totalVisits++; const d = todayStr(); stats.dailyVisits[d] = (stats.dailyVisits[d] || 0) + 1; }
-function recordTranscription() { stats.totalTranscriptions++; const d = todayStr(); stats.dailyTranscriptions[d] = (stats.dailyTranscriptions[d] || 0) + 1; }
-function getKey(ip) { return `${ip}::${todayStr()}`; }
-function getUsage(ip) { return usageMap[getKey(ip)] || 0; }
-function incrementUsage(ip) { const k = getKey(ip); usageMap[k] = (usageMap[k] || 0) + 1; }
+
+function getUsageKey(ip) { return `usage:${ip}:${todayStr()}`; }
+
+// Seconds until end of today (so Redis key expires at midnight)
+function secondsUntilMidnight() {
+  const now = new Date();
+  const midnight = new Date(now);
+  midnight.setUTCHours(24, 0, 0, 0);
+  return Math.floor((midnight - now) / 1000);
+}
+
+async function getUsage(ip) {
+  const val = await redisGet(getUsageKey(ip));
+  return val ? parseInt(val) : 0;
+}
+
+async function incrementUsage(ip) {
+  return await redisIncr(getUsageKey(ip), secondsUntilMidnight());
+}
 
 const limiter = rateLimit({ windowMs: 60 * 1000, max: 20, message: { error: "Too many requests. Please slow down." } });
 app.use(limiter);
 
 app.get("/", (req, res) => { recordVisit(); res.json({ status: "French Oral Master API running 🇫🇷" }); });
 
-app.get("/usage", (req, res) => {
+app.get("/usage", async (req, res) => {
   const ip = req.headers["x-forwarded-for"]?.split(",")[0] || req.ip;
-  const used = getUsage(ip);
+  const used = await getUsage(ip);
   res.json({ used, limit: FREE_DAILY_LIMIT, remaining: Math.max(0, FREE_DAILY_LIMIT - used) });
 });
 
-app.get("/stats", (req, res) => {
+app.get("/stats", async (req, res) => {
   if (req.query.password !== STATS_PASSWORD) return res.status(403).json({ error: "Access denied." });
   const today = todayStr();
-  const last7 = [];
-  for (let i = 6; i >= 0; i--) {
-    const d = new Date(); d.setDate(d.getDate() - i);
-    const key = d.toISOString().slice(0, 10);
-    last7.push({ date: key, visits: stats.dailyVisits[key] || 0, transcriptions: stats.dailyTranscriptions[key] || 0 });
-  }
+  const totalTranscriptions = await redisGet("stats:total_transcriptions") || 0;
+  const todayTranscriptions = await redisGet(`stats:transcriptions:${today}`) || 0;
   res.json({
     "🇫🇷 French Oral Master — Your Stats": "━━━━━━━━━━━━━━━━━━━━━━━━",
     total_visits_ever: stats.totalVisits,
-    total_transcriptions_ever: stats.totalTranscriptions,
+    total_transcriptions_ever: parseInt(totalTranscriptions),
     today_visits: stats.dailyVisits[today] || 0,
-    today_transcriptions: stats.dailyTranscriptions[today] || 0,
-    last_7_days: last7,
+    today_transcriptions: parseInt(todayTranscriptions),
     free_limit_per_user: FREE_DAILY_LIMIT,
     server_time: new Date().toISOString(),
   });
@@ -75,7 +120,8 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
     const isOwner = OWNER_SECRET && ownerSecret === OWNER_SECRET;
     if (isOwner) console.log(`[TRANSCRIBE] 👑 Owner mode — limit bypassed`);
 
-    if (!isOwner && getUsage(ip) >= FREE_DAILY_LIMIT) {
+    const currentUsage = await getUsage(ip);
+    if (!isOwner && currentUsage >= FREE_DAILY_LIMIT) {
       return res.status(429).json({ error: "daily_limit", message: `You have used your ${FREE_DAILY_LIMIT} free transcriptions for today. Come back tomorrow!` });
     }
     if (!req.file) return res.status(400).json({ error: "No audio file provided." });
@@ -102,10 +148,12 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
     const transcript = rawBody.trim();
     if (!transcript) return res.status(502).json({ error: "Groq returned empty transcription." });
 
-    if (!isOwner) incrementUsage(ip);
-    recordTranscription();
+    if (!isOwner) await incrementUsage(ip);
+    // Record transcription stats in Redis (persists across restarts)
+    redisIncr("stats:total_transcriptions", null);
+    redisIncr(`stats:transcriptions:${todayStr()}`, secondsUntilMidnight());
 
-    const used = getUsage(ip);
+    const used = await getUsage(ip);
     console.log(`[TRANSCRIBE] ✅ Success! Length: ${transcript.length}, usage: ${used}/${FREE_DAILY_LIMIT}`);
     res.json({ transcript, usage: { used, limit: FREE_DAILY_LIMIT, remaining: Math.max(0, FREE_DAILY_LIMIT - used) } });
 
