@@ -115,7 +115,7 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
   }
 });
 
-// ── Study guide endpoint — Google Gemini with fallbacks ───────────────────────
+// ── Study guide endpoint — Gemini first, Groq as fallback ────────────────────
 app.post("/study-guide", async (req, res) => {
   console.log(`[STUDY-GUIDE] Request received`);
   try {
@@ -126,15 +126,16 @@ app.post("/study-guide", async (req, res) => {
 
     const prompt = `You are a French oral exam coach. Here is a transcription of a French oral exam audio:\n\n"${transcript}"\n\nWrite a study guide using EXACTLY these headers:\n\n**SUMMARY**\n[2-3 sentence summary in English]\n\n**KEY VOCABULARY**\n[8-10 important words/phrases, format: French word - English meaning]\n\n**GRAMMAR POINTS**\n[3-4 grammar structures used in the audio]\n\n**SAMPLE QUESTIONS & MODEL ANSWERS**\n[3 exam questions with model French answers + English translation]\n\n**TIPS TO ACE THIS TOPIC**\n[3-4 practical tips for the oral exam]`;
 
-    // Try Gemini models one by one until one works
-    const models = ["gemini-2.0-flash", "gemini-2.0-flash-exp", "gemini-1.5-flash-latest", "gemini-1.5-flash"];
     let guide = "";
     let lastError = "";
 
-    for (const model of models) {
-      console.log(`[STUDY-GUIDE] Trying: ${model}`);
+    // ── Try Gemini first ──────────────────────────────────────────────────────
+    const geminiModels = ["gemini-2.0-flash", "gemini-2.0-flash-exp", "gemini-1.5-flash-latest", "gemini-1.5-flash"];
+    for (const model of geminiModels) {
+      if (guide) break;
+      console.log(`[STUDY-GUIDE] Trying Gemini: ${model}`);
       try {
-        const res2 = await fetch(
+        const r = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_KEY}`,
           {
             method: "POST",
@@ -145,20 +146,47 @@ app.post("/study-guide", async (req, res) => {
             }),
           }
         );
-        const data = await res2.json();
-        console.log(`[STUDY-GUIDE] ${model} status: ${res2.status}`);
-
-        if (res2.ok && data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+        const data = await r.json();
+        console.log(`[STUDY-GUIDE] Gemini ${model} status: ${r.status}`);
+        if (r.ok && data?.candidates?.[0]?.content?.parts?.[0]?.text) {
           guide = data.candidates[0].content.parts[0].text;
-          console.log(`[STUDY-GUIDE] ✅ Success with ${model}!`);
-          break;
+          console.log(`[STUDY-GUIDE] ✅ Gemini success with ${model}!`);
         } else {
-          lastError = JSON.stringify(data).slice(0, 300);
-          console.log(`[STUDY-GUIDE] ❌ ${model} failed: ${lastError}`);
+          lastError = JSON.stringify(data).slice(0, 200);
+          console.log(`[STUDY-GUIDE] ❌ Gemini ${model} failed: ${lastError}`);
         }
       } catch (err) {
         lastError = err.message;
-        console.log(`[STUDY-GUIDE] ❌ ${model} threw: ${err.message}`);
+        console.log(`[STUDY-GUIDE] ❌ Gemini ${model} threw: ${err.message}`);
+      }
+    }
+
+    // ── Fall back to Groq if Gemini failed ───────────────────────────────────
+    if (!guide) {
+      console.log(`[STUDY-GUIDE] Gemini unavailable — falling back to Groq...`);
+      const groqModels = ["llama-3.3-70b-versatile", "llama3-8b-8192", "gemma2-9b-it"];
+      for (const model of groqModels) {
+        if (guide) break;
+        console.log(`[STUDY-GUIDE] Trying Groq: ${model}`);
+        try {
+          const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${GROQ_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ model, max_tokens: 1200, messages: [{ role: "user", content: prompt }] }),
+          });
+          const data = await r.json();
+          console.log(`[STUDY-GUIDE] Groq ${model} status: ${r.status}`);
+          if (r.ok && data?.choices?.[0]?.message?.content) {
+            guide = data.choices[0].message.content;
+            console.log(`[STUDY-GUIDE] ✅ Groq success with ${model}!`);
+          } else {
+            lastError = JSON.stringify(data).slice(0, 200);
+            console.log(`[STUDY-GUIDE] ❌ Groq ${model} failed: ${lastError}`);
+          }
+        } catch (err) {
+          lastError = err.message;
+          console.log(`[STUDY-GUIDE] ❌ Groq ${model} threw: ${err.message}`);
+        }
       }
     }
 
