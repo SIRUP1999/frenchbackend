@@ -164,7 +164,7 @@ app.post("/study-guide", async (req, res) => {
     // ── Fall back to Groq if Gemini failed ───────────────────────────────────
     if (!guide) {
       console.log(`[STUDY-GUIDE] Gemini unavailable — falling back to Groq...`);
-      const groqModels = ["llama-3.3-70b-versatile", "llama3-8b-8192", "gemma2-9b-it"];
+     const groqModels = ["llama-3.3-70b-versatile", "llama3-8b-8192", "llama-3.1-8b-instant"];
       for (const model of groqModels) {
         if (guide) break;
         console.log(`[STUDY-GUIDE] Trying Groq: ${model}`);
