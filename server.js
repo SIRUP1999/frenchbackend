@@ -164,7 +164,7 @@ app.post("/study-guide", async (req, res) => {
     // ── Fall back to Groq if Gemini failed ───────────────────────────────────
     if (!guide) {
       console.log(`[STUDY-GUIDE] Gemini unavailable — falling back to Groq...`);
-     const groqModels = ["llama-3.3-70b-versatile", "llama3-8b-8192", "llama-3.1-8b-instant"];
+      const groqModels = ["llama-3.3-70b-versatile", "llama3-8b-8192", "llama-3.1-8b-instant"];
       for (const model of groqModels) {
         if (guide) break;
         console.log(`[STUDY-GUIDE] Trying Groq: ${model}`);
@@ -203,4 +203,18 @@ app.post("/study-guide", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+
+  // ── Keep-alive ping — prevents Render free tier from sleeping ──────────────
+  // Pings itself every 14 minutes (Render sleeps after 15 min of inactivity)
+  const BACKEND_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  setInterval(async () => {
+    try {
+      await fetch(`${BACKEND_URL}/`);
+      console.log(`[KEEPALIVE] ✅ Pinged ${BACKEND_URL} — server staying awake`);
+    } catch(e) {
+      console.log(`[KEEPALIVE] ⚠️ Ping failed: ${e.message}`);
+    }
+  }, 14 * 60 * 1000); // every 14 minutes
+});
