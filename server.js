@@ -47,7 +47,6 @@ async function redisGet(key) {
 async function redisIncr(key) {
   try {
     const res = await fetch(`${UPSTASH_URL}/incr/${encodeURIComponent(key)}`, {
-      method: "POST",
       headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
     });
     const d = await res.json();
@@ -62,7 +61,6 @@ async function redisIncr(key) {
 async function redisExpire(key, seconds) {
   try {
     const res = await fetch(`${UPSTASH_URL}/expire/${encodeURIComponent(key)}/${seconds}`, {
-      method: "POST",
       headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
     });
     const d = await res.json();
