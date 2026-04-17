@@ -187,12 +187,15 @@ async function transcribeWithRetry(buf, name, mime, retries = 3) {
 // ── Analytics & Live Users ────────────────────────────────────────────────────
 const liveUsers = new Set(); // Track active connections
 const transcriptionLog = []; // Store recent transcriptions
-const MAX_LOG_SIZE = 100; // Keep last 100 transcriptions
+const MAX_LOG_SIZE = 50; // Keep last 50 transcriptions
 
 // Middleware to track live users
 app.use((req, res, next) => {
   const userKey = req.headers['x-session-token'] || getIP(req);
   liveUsers.add(userKey);
+  
+  // Log user activity for debugging
+  console.log(`[ACTIVITY] ${userKey.slice(0,12)} → ${req.method} ${req.path}`);
   
   // Remove user after 5 minutes of inactivity
   setTimeout(() => liveUsers.delete(userKey), 5 * 60 * 1000);
