@@ -311,8 +311,8 @@ app.post('/create-payment', async (req, res) => {
   // Payment packages
   const packages = {
     small: { price: 5, transcriptions: 10, name: '10 Extra Transcriptions' },
-    medium: { price: 12, transcriptions: 25, name: '25 Extra Transcriptions' },
-    large: { price: 20, transcriptions: 50, name: '50 Extra Transcriptions' }
+    medium: { price: 12, transcriptions: 20, name: '20 Extra Transcriptions' },
+    large: { price: 20, transcriptions: 30, name: '30 Extra Transcriptions' }
   };
   
   const selectedPackage = packages[package];
