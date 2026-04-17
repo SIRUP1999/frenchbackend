@@ -184,6 +184,39 @@ async function transcribeWithRetry(buf, name, mime, retries = 3) {
   return { ok: false, error: "Transcription failed after multiple attempts. Please try again." };
 }
 
+// ── Analytics & Live Users ────────────────────────────────────────────────────
+const liveUsers = new Set(); // Track active connections
+const transcriptionLog = []; // Store recent transcriptions
+const MAX_LOG_SIZE = 100; // Keep last 100 transcriptions
+
+// Middleware to track live users
+app.use((req, res, next) => {
+  const userKey = req.headers['x-session-token'] || getIP(req);
+  liveUsers.add(userKey);
+  
+  // Remove user after 5 minutes of inactivity
+  setTimeout(() => liveUsers.delete(userKey), 5 * 60 * 1000);
+  
+  next();
+});
+
+function logTranscription(token, ip, filename, transcript) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    userToken: token ? token.slice(0, 8) + '...' : null,
+    userIP: ip,
+    filename,
+    transcriptPreview: transcript.slice(0, 100) + (transcript.length > 100 ? '...' : ''),
+    transcriptLength: transcript.length
+  };
+  
+  transcriptionLog.unshift(entry);
+  if (transcriptionLog.length > MAX_LOG_SIZE) {
+    transcriptionLog.pop();
+  }
+  
+  console.log(`[ANALYTICS] New transcription: ${filename} (${transcript.length} chars)`);
+}
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const stats = { visits: 0 };
 const limiter = rateLimit({ windowMs: 60000, max: 30, message: { error: "Too many requests. Please slow down." } });
@@ -224,6 +257,25 @@ app.get("/usage", async (req, res) => {
     used = await getUsageByIP(ip);
   }
   res.json({ used, limit: FREE_DAILY_LIMIT, remaining: Math.max(0, FREE_DAILY_LIMIT - used) });
+});
+
+// ── Analytics Dashboard ─────────────────────────────────────────────────────
+app.get("/analytics", async (req, res) => {
+  if (req.query.password !== STATS_PASSWORD) return res.status(403).json({ error: "Access denied." });
+  
+  const total = await redis("GET", "fom:stats:total") || 0;
+  const today = await redis("GET", `fom:stats:day:${todayStr()}`) || 0;
+  
+  res.json({
+    "🇫🇷 French Oral Master Analytics": "━━━━━━━━━━━━━━━━━━",
+    live_users_now: liveUsers.size,
+    total_transcriptions_ever: parseInt(total),
+    today_transcriptions: parseInt(today),
+    session_visits: stats.visits,
+    free_limit_per_user: FREE_DAILY_LIMIT,
+    server_time: new Date().toISOString(),
+    recent_transcriptions: transcriptionLog.slice(0, 20) // Last 20 transcriptions
+  });
 });
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -287,6 +339,9 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
     redis("INCR", "fom:stats:total");
     const dayKey = `fom:stats:day:${todayStr()}`;
     redis("INCR", dayKey).then(v => { if (v === 1) redis("EXPIRE", dayKey, 60 * 60 * 24 * 7); });
+
+    // Log the transcription for analytics
+    logTranscription(token, ip, req.file.originalname, result.transcript);
 
     console.log(`[TRANSCRIBE] ✅ Done. Usage now: ${used}/${FREE_DAILY_LIMIT}`);
     res.json({
@@ -373,4 +428,4 @@ app.listen(PORT, () => {
     try { await fetch(`${SELF}/`); console.log(`[KEEPALIVE] ✅ Awake`); }
     catch (e) { console.log(`[KEEPALIVE] ⚠️ ${e.message}`); }
   }, 14 * 60 * 1000);
-});
+});  
