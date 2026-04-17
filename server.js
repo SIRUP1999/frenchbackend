@@ -67,7 +67,8 @@ function secondsUntilMidnight() {
 function generateToken() { return crypto.randomBytes(16).toString("hex"); }
 
 // ── Paystack Payment Functions ────────────────────────────────────────────────
-// FIXED: channels explicitly includes mobile_money for GHS MoMo PIN prompt
+// FIX: removed channels array — Paystack auto-selects MoMo for GHS transactions
+// which properly triggers the Mobile Money PIN prompt in Ghana
 async function createPayment(email, amount, metadata, callbackUrl) {
   try {
     const body = {
@@ -75,11 +76,10 @@ async function createPayment(email, amount, metadata, callbackUrl) {
       amount: amount * 100,   // Paystack uses pesewas (GHS × 100)
       currency: "GHS",
       metadata,
-      // FIXED: explicitly list channels so mobile money PIN prompt appears
-      channels: ["mobile_money", "card"],
+      // NO channels restriction — let Paystack handle it automatically.
+      // Restricting channels was preventing the MoMo PIN prompt from appearing.
     };
 
-    // FIXED: always set callback_url so Paystack redirects back after payment
     if (callbackUrl) {
       body.callback_url = callbackUrl;
     }
@@ -235,7 +235,6 @@ async function transcribeWithRetry(buf, name, mime, retries = 3) {
 
       if (res.status === 400) {
         if (attempt === 1) {
-          // Retry with forced mp3 mime
           const f2 = new FormData();
           f2.append("file", buf, { filename: "audio.mp3", contentType: "audio/mpeg" });
           f2.append("model", "whisper-large-v3-turbo");
@@ -338,7 +337,6 @@ app.get("/usage", async (req, res) => {
 });
 
 // ── Create Payment ────────────────────────────────────────────────────────────
-// FIXED: accepts 'pkg' (not 'package' — reserved word), passes callback_url to Paystack
 app.post("/create-payment", async (req, res) => {
   const { email, pkg, callback_url } = req.body;
   const token = req.headers["x-session-token"];
@@ -399,7 +397,6 @@ app.post("/verify-payment", async (req, res) => {
     const metadata = verification.data.metadata;
     console.log("[PAYMENT] Metadata:", metadata);
 
-    // FIXED: fall back to header token if metadata.token is missing
     const userToken = (metadata && metadata.token) || req.headers["x-session-token"];
     const transcriptions = parseInt((metadata && metadata.transcriptions) || 10);
 
@@ -499,7 +496,6 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
 
     if (!isOwner) {
       if (currentUsage >= FREE_DAILY_LIMIT) {
-        // Use an extra transcription
         const success = await useExtraTranscription(token);
         if (success) {
           usedExtra = true;
@@ -512,7 +508,6 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
       }
     }
 
-    // Update global stats
     redis("INCR", "fom:stats:total");
     const dayKey = `fom:stats:day:${todayStr()}`;
     redis("INCR", dayKey).then(v => { if (v === 1) redis("EXPIRE", dayKey, 60 * 60 * 24 * 7); });
@@ -540,13 +535,11 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
 });
 
 // ── Study guide ───────────────────────────────────────────────────────────────
-// FIXED: prompt explicitly instructs model to use **BOLD** headers only
 app.post("/study-guide", async (req, res) => {
   try {
     const { transcript } = req.body;
     if (!transcript?.trim()) return res.status(400).json({ error: "No transcript provided." });
 
-    // FIXED: very explicit about format — bold asterisks ONLY, no ## headers
     const prompt = `You are a French oral exam coach. Here is a transcription of a French oral exam audio:
 
 "${transcript}"
@@ -577,7 +570,6 @@ CRITICAL FORMATTING RULES:
     let guide = "";
     let lastError = "";
 
-    // Try Gemini first
     for (const model of ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]) {
       if (guide) break;
       try {
@@ -596,7 +588,6 @@ CRITICAL FORMATTING RULES:
         if (r.ok && data?.candidates?.[0]?.content?.parts?.[0]?.text) {
           guide = data.candidates[0].content.parts[0].text;
           console.log(`[STUDY-GUIDE] ✅ Gemini ${model} — ${guide.length} chars`);
-          // Debug: log first 300 chars to verify header format
           console.log(`[STUDY-GUIDE] Preview: ${guide.slice(0, 300)}`);
         } else {
           lastError = JSON.stringify(data).slice(0, 200);
@@ -608,7 +599,6 @@ CRITICAL FORMATTING RULES:
       }
     }
 
-    // Fall back to Groq
     if (!guide) {
       for (const model of ["llama-3.3-70b-versatile", "llama3-8b-8192", "llama-3.1-8b-instant"]) {
         if (guide) break;
