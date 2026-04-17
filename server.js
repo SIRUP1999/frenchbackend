@@ -9,11 +9,11 @@ const crypto = require("crypto");
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
-const GROQ_KEY     = process.env.GROQ_API_KEY;
-const GEMINI_KEY   = process.env.GEMINI_API_KEY;
-const OWNER_SECRET = process.env.OWNER_SECRET || "";
+const GROQ_KEY        = process.env.GROQ_API_KEY;
+const GEMINI_KEY      = process.env.GEMINI_API_KEY;
+const OWNER_SECRET    = process.env.OWNER_SECRET || "";
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
-const PORT         = process.env.PORT || 3000;
+const PORT            = process.env.PORT || 3000;
 const FREE_DAILY_LIMIT = 7;
 const STATS_PASSWORD   = process.env.STATS_PASSWORD || "nana2026";
 const UPSTASH_URL      = process.env.UPSTASH_REDIS_REST_URL;
@@ -67,75 +67,82 @@ function secondsUntilMidnight() {
 function generateToken() { return crypto.randomBytes(16).toString("hex"); }
 
 // ── Paystack Payment Functions ────────────────────────────────────────────────
-// FIX: accept callbackUrl so Paystack knows where to send the user after payment
+// FIXED: channels explicitly includes mobile_money for GHS MoMo PIN prompt
 async function createPayment(email, amount, metadata, callbackUrl) {
   try {
     const body = {
       email,
-      amount: amount * 100,   // Paystack uses pesewas (GHS * 100)
-      currency: 'GHS',
+      amount: amount * 100,   // Paystack uses pesewas (GHS × 100)
+      currency: "GHS",
       metadata,
-      channels: ['mobile_money', 'card'],
+      // FIXED: explicitly list channels so mobile money PIN prompt appears
+      channels: ["mobile_money", "card"],
     };
 
-    // FIX: only add callback_url if it's actually provided
+    // FIXED: always set callback_url so Paystack redirects back after payment
     if (callbackUrl) {
       body.callback_url = callbackUrl;
     }
 
-    const res = await fetch('https://api.paystack.co/transaction/initialize', {
-      method: 'POST',
+    console.log("[PAYSTACK] Initializing payment:", { email, amount, currency: "GHS", callbackUrl });
+
+    const res = await fetch("https://api.paystack.co/transaction/initialize", {
+      method: "POST",
       headers: {
         Authorization: `Bearer ${PAYSTACK_SECRET}`,
-        'Content-Type': 'application/json',
+        "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
     });
+
     const data = await res.json();
-    console.log('[PAYSTACK] Initialize response:', JSON.stringify(data).slice(0, 300));
+    console.log("[PAYSTACK] Initialize response status:", res.status);
+    console.log("[PAYSTACK] Initialize response:", JSON.stringify(data).slice(0, 400));
     return data;
   } catch (e) {
-    console.error('[PAYSTACK] Create payment error:', e.message);
-    return { status: false, message: 'Payment initialization failed' };
+    console.error("[PAYSTACK] Create payment error:", e.message);
+    return { status: false, message: "Payment initialization failed: " + e.message };
   }
 }
 
 async function verifyPaystackPayment(reference) {
   try {
-    const res = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, {
+    const url = `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`;
+    console.log("[PAYSTACK] Verifying:", url);
+    const res = await fetch(url, {
       headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` },
     });
     const data = await res.json();
-    console.log('[PAYSTACK] Verify response:', JSON.stringify(data).slice(0, 300));
+    console.log("[PAYSTACK] Verify response:", JSON.stringify(data).slice(0, 400));
     return data;
   } catch (e) {
-    console.error('[PAYSTACK] Verify payment error:', e.message);
+    console.error("[PAYSTACK] Verify payment error:", e.message);
     return { status: false };
   }
 }
 
-// Add extra transcriptions to user's account
+// ── Extra transcription management ───────────────────────────────────────────
 async function addExtraTranscriptions(token, count) {
   const key = `fom:extra:${token}`;
-  const current = await redis('GET', key) || 0;
+  const current = await redis("GET", key) || 0;
   const newTotal = parseInt(current) + count;
-  await redis('SET', key, newTotal);
-  await redis('EXPIRE', key, 60 * 60 * 24 * 30); // 30 days
-  console.log(`[PAYMENT] Added ${count} extra transcriptions to ${token.slice(0,8)}... (total: ${newTotal})`);
+  await redis("SET", key, newTotal);
+  await redis("EXPIRE", key, 60 * 60 * 24 * 30); // 30 days
+  console.log(`[PAYMENT] Added ${count} extra → ${token.slice(0,8)}... total=${newTotal}`);
   return newTotal;
 }
 
 async function getExtraTranscriptions(token) {
   const key = `fom:extra:${token}`;
-  const val = await redis('GET', key);
+  const val = await redis("GET", key);
   return val ? parseInt(val) : 0;
 }
 
 async function useExtraTranscription(token) {
   const key = `fom:extra:${token}`;
-  const current = await redis('GET', key) || 0;
+  const current = await redis("GET", key) || 0;
   if (parseInt(current) > 0) {
-    await redis('DECR', key);
+    await redis("DECR", key);
     return true;
   }
   return false;
@@ -159,7 +166,7 @@ async function incrementUsageByToken(token) {
     await redis("EXPIRE", key, secs);
     console.log(`[USAGE] New key ${key}, expires in ${secs}s`);
   }
-  console.log(`[USAGE] token ${token.slice(0,8)}... incremented to ${newVal}`);
+  console.log(`[USAGE] token ${token.slice(0,8)}... → ${newVal}`);
   return newVal || 1;
 }
 
@@ -191,7 +198,7 @@ function getAudioMime(name, mime) {
   const ext = (name || "").split(".").pop().toLowerCase();
   const map = {
     mp3:"audio/mpeg", m4a:"audio/mp4", mp4:"audio/mp4",
-    ogg:"audio/ogg", wav:"audio/wav", aac:"audio/aac",
+    ogg:"audio/ogg",  wav:"audio/wav", aac:"audio/aac",
     webm:"audio/webm", opus:"audio/ogg", mpeg:"audio/mpeg",
     mpga:"audio/mpeg", flac:"audio/flac",
   };
@@ -228,6 +235,7 @@ async function transcribeWithRetry(buf, name, mime, retries = 3) {
 
       if (res.status === 400) {
         if (attempt === 1) {
+          // Retry with forced mp3 mime
           const f2 = new FormData();
           f2.append("file", buf, { filename: "audio.mp3", contentType: "audio/mpeg" });
           f2.append("model", "whisper-large-v3-turbo");
@@ -264,7 +272,7 @@ const transcriptionLog = [];
 const MAX_LOG_SIZE = 50;
 
 app.use((req, res, next) => {
-  const userKey = req.headers['x-session-token'] || getIP(req);
+  const userKey = req.headers["x-session-token"] || getIP(req);
   liveUsers.add(userKey);
   console.log(`[ACTIVITY] ${userKey.slice(0,12)} → ${req.method} ${req.path}`);
   setTimeout(() => liveUsers.delete(userKey), 5 * 60 * 1000);
@@ -274,10 +282,10 @@ app.use((req, res, next) => {
 function logTranscription(token, ip, filename, transcript) {
   const entry = {
     timestamp: new Date().toISOString(),
-    userToken: token ? token.slice(0, 8) + '...' : null,
+    userToken: token ? token.slice(0, 8) + "..." : null,
     userIP: ip,
     filename,
-    transcriptPreview: transcript.slice(0, 100) + (transcript.length > 100 ? '...' : ''),
+    transcriptPreview: transcript.slice(0, 100) + (transcript.length > 100 ? "..." : ""),
     transcriptLength: transcript.length,
   };
   transcriptionLog.unshift(entry);
@@ -296,89 +304,13 @@ app.get("/", (req, res) => {
   res.json({ status: "French Oral Master API 🇫🇷" });
 });
 
-// ── Payment Endpoints ─────────────────────────────────────────────────────────
-app.post('/create-payment', async (req, res) => {
-  // FIX: use 'pkg' instead of 'package' (package is a reserved word in strict JS)
-  const { email, pkg, callback_url } = req.body;
-  const token = req.headers['x-session-token'];
-
-  if (!email || !pkg || !token) {
-    return res.status(400).json({ error: 'Missing email, pkg, or session token' });
-  }
-
-  const packages = {
-    small:  { price: 5,  transcriptions: 10, name: '10 Extra Transcriptions' },
-    medium: { price: 12, transcriptions: 20, name: '20 Extra Transcriptions' },
-    large:  { price: 20, transcriptions: 30, name: '30 Extra Transcriptions' },
-  };
-
-  const selectedPackage = packages[pkg];
-  if (!selectedPackage) {
-    return res.status(400).json({ error: 'Invalid package selected' });
-  }
-
-  // FIX: pass callback_url from frontend through to Paystack
-  const payment = await createPayment(
-    email,
-    selectedPackage.price,
-    { token, pkg, transcriptions: selectedPackage.transcriptions },
-    callback_url || null
-  );
-
-  if (payment.status) {
-    console.log(`[PAYMENT] Created for ${email}: ${selectedPackage.name} — GHS ${selectedPackage.price}`);
-    res.json({
-      status: true,
-      payment_url: payment.data.authorization_url,
-      reference: payment.data.reference,
-    });
-  } else {
-    console.error('[PAYMENT] Failed:', payment.message);
-    res.status(500).json({ error: payment.message || 'Payment creation failed' });
-  }
-});
-
-app.post('/verify-payment', async (req, res) => {
-  const { reference } = req.body;
-
-  if (!reference) {
-    return res.status(400).json({ error: 'Payment reference required' });
-  }
-
-  const verification = await verifyPaystackPayment(reference);
-
-  if (verification.status && verification.data && verification.data.status === 'success') {
-    const metadata = verification.data.metadata;
-
-    // FIX: metadata.token may be missing if session changed — fallback to header token
-    const userToken = metadata.token || req.headers['x-session-token'];
-    const transcriptions = parseInt(metadata.transcriptions || 10);
-
-    if (!userToken) {
-      return res.status(400).json({ error: 'Cannot identify user session to credit transcriptions' });
-    }
-
-    const newTotal = await addExtraTranscriptions(userToken, transcriptions);
-    console.log(`[PAYMENT] ✅ Verified: ${reference} — Added ${transcriptions} transcriptions to ${userToken.slice(0,8)}...`);
-
-    res.json({
-      status: true,
-      message: 'Payment successful!',
-      extra_transcriptions: newTotal,
-    });
-  } else {
-    console.error('[PAYMENT] Verification failed for reference:', reference);
-    res.status(400).json({ error: 'Payment verification failed or payment not yet complete' });
-  }
-});
-
 // ── Session ───────────────────────────────────────────────────────────────────
 app.get("/session", async (req, res) => {
   const existing = req.headers["x-session-token"];
   if (existing && existing.length === 32) {
     const used = await getUsageByToken(existing);
     const extra = await getExtraTranscriptions(existing);
-    console.log(`[SESSION] Existing token ${existing.slice(0,8)}... used=${used} extra=${extra}`);
+    console.log(`[SESSION] Existing ${existing.slice(0,8)}... used=${used} extra=${extra}`);
     return res.json({
       token: existing,
       used,
@@ -403,6 +335,94 @@ app.get("/usage", async (req, res) => {
     used = await getUsageByIP(ip);
   }
   res.json({ used, limit: FREE_DAILY_LIMIT, remaining: Math.max(0, FREE_DAILY_LIMIT - used) });
+});
+
+// ── Create Payment ────────────────────────────────────────────────────────────
+// FIXED: accepts 'pkg' (not 'package' — reserved word), passes callback_url to Paystack
+app.post("/create-payment", async (req, res) => {
+  const { email, pkg, callback_url } = req.body;
+  const token = req.headers["x-session-token"];
+
+  console.log(`[PAYMENT] create-payment: email=${email} pkg=${pkg} token=${token ? token.slice(0,8)+'...' : 'none'} callback=${callback_url}`);
+
+  if (!email || !pkg || !token) {
+    console.error("[PAYMENT] Missing required fields:", { email: !!email, pkg: !!pkg, token: !!token });
+    return res.status(400).json({ error: "Missing email, pkg, or session token" });
+  }
+
+  const packages = {
+    small:  { price: 5,  transcriptions: 10, name: "10 Extra Transcriptions" },
+    medium: { price: 12, transcriptions: 20, name: "20 Extra Transcriptions" },
+    large:  { price: 20, transcriptions: 30, name: "30 Extra Transcriptions" },
+  };
+
+  const selectedPkg = packages[pkg];
+  if (!selectedPkg) {
+    console.error("[PAYMENT] Invalid package:", pkg);
+    return res.status(400).json({ error: "Invalid package. Choose: small, medium, or large" });
+  }
+
+  const payment = await createPayment(
+    email,
+    selectedPkg.price,
+    { token, pkg, transcriptions: selectedPkg.transcriptions },
+    callback_url || null
+  );
+
+  if (payment.status && payment.data && payment.data.authorization_url) {
+    console.log(`[PAYMENT] ✅ Created for ${email}: ${selectedPkg.name} — GHS ${selectedPkg.price}`);
+    console.log(`[PAYMENT] Auth URL: ${payment.data.authorization_url}`);
+    res.json({
+      status: true,
+      payment_url: payment.data.authorization_url,
+      reference: payment.data.reference,
+    });
+  } else {
+    const errMsg = payment.message || payment.data?.message || "Payment creation failed";
+    console.error("[PAYMENT] ❌ Failed:", errMsg, payment);
+    res.status(500).json({ error: errMsg });
+  }
+});
+
+// ── Verify Payment ────────────────────────────────────────────────────────────
+app.post("/verify-payment", async (req, res) => {
+  const { reference } = req.body;
+  console.log(`[PAYMENT] verify-payment: reference=${reference}`);
+
+  if (!reference) {
+    return res.status(400).json({ error: "Payment reference is required" });
+  }
+
+  const verification = await verifyPaystackPayment(reference);
+
+  if (verification.status && verification.data && verification.data.status === "success") {
+    const metadata = verification.data.metadata;
+    console.log("[PAYMENT] Metadata:", metadata);
+
+    // FIXED: fall back to header token if metadata.token is missing
+    const userToken = (metadata && metadata.token) || req.headers["x-session-token"];
+    const transcriptions = parseInt((metadata && metadata.transcriptions) || 10);
+
+    if (!userToken) {
+      console.error("[PAYMENT] No token found in metadata or header");
+      return res.status(400).json({ error: "Cannot identify user session to credit transcriptions. Please contact support." });
+    }
+
+    const newTotal = await addExtraTranscriptions(userToken, transcriptions);
+    console.log(`[PAYMENT] ✅ Verified ${reference} — added ${transcriptions} to ${userToken.slice(0,8)}... total=${newTotal}`);
+
+    res.json({
+      status: true,
+      message: "Payment successful!",
+      extra_transcriptions: newTotal,
+    });
+  } else {
+    const paystackStatus = verification.data?.status || "unknown";
+    console.error(`[PAYMENT] ❌ Verification failed for ${reference}. Paystack status: ${paystackStatus}`);
+    res.status(400).json({
+      error: `Payment verification failed. Paystack status: ${paystackStatus}. If you were charged, contact support with reference: ${reference}`
+    });
+  }
 });
 
 // ── Analytics Dashboard ───────────────────────────────────────────────────────
@@ -449,9 +469,7 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
     if (isOwner) console.log(`[TRANSCRIBE] 👑 Owner mode`);
 
     const useToken = !!(token && token.length === 32);
-    let currentUsage = useToken
-      ? await getUsageByToken(token)
-      : await getUsageByIP(ip);
+    let currentUsage = useToken ? await getUsageByToken(token) : await getUsageByIP(ip);
 
     let extraTranscriptions = 0;
     if (useToken) {
@@ -461,10 +479,10 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
     console.log(`[TRANSCRIBE] Usage: ${currentUsage}/${FREE_DAILY_LIMIT} by ${useToken ? "token" : "IP"}, extra: ${extraTranscriptions}`);
 
     if (!isOwner && currentUsage >= FREE_DAILY_LIMIT && extraTranscriptions === 0) {
-      console.log(`[TRANSCRIBE] ⛔ Daily limit reached, no extra transcriptions`);
+      console.log(`[TRANSCRIBE] ⛔ Daily limit reached, no extras`);
       return res.status(429).json({
         error: "daily_limit",
-        message: `You have used your ${FREE_DAILY_LIMIT} free transcriptions for today. Buy more transcriptions or come back tomorrow! ☀️`,
+        message: `You've used all ${FREE_DAILY_LIMIT} free transcriptions for today. Buy extra transcriptions or come back tomorrow! ☀️`,
       });
     }
 
@@ -478,10 +496,15 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
 
     let used = currentUsage;
     let usedExtra = false;
+
     if (!isOwner) {
       if (currentUsage >= FREE_DAILY_LIMIT) {
+        // Use an extra transcription
         const success = await useExtraTranscription(token);
-        if (success) { usedExtra = true; console.log(`[TRANSCRIBE] Used 1 extra transcription`); }
+        if (success) {
+          usedExtra = true;
+          console.log(`[TRANSCRIBE] Used 1 extra transcription`);
+        }
       } else {
         used = useToken
           ? await incrementUsageByToken(token)
@@ -489,13 +512,14 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
       }
     }
 
+    // Update global stats
     redis("INCR", "fom:stats:total");
     const dayKey = `fom:stats:day:${todayStr()}`;
     redis("INCR", dayKey).then(v => { if (v === 1) redis("EXPIRE", dayKey, 60 * 60 * 24 * 7); });
 
     logTranscription(token, ip, req.file.originalname, result.transcript);
 
-    console.log(`[TRANSCRIBE] ✅ Done. Usage: ${used}/${FREE_DAILY_LIMIT}${usedExtra ? ' (used extra)' : ''}`);
+    console.log(`[TRANSCRIBE] ✅ Done. Usage=${used}/${FREE_DAILY_LIMIT}${usedExtra ? " (used extra)" : ""}`);
 
     const finalExtra = useToken ? await getExtraTranscriptions(token) : 0;
 
@@ -516,15 +540,44 @@ app.post("/transcribe", upload.single("file"), async (req, res) => {
 });
 
 // ── Study guide ───────────────────────────────────────────────────────────────
+// FIXED: prompt explicitly instructs model to use **BOLD** headers only
 app.post("/study-guide", async (req, res) => {
   try {
     const { transcript } = req.body;
     if (!transcript?.trim()) return res.status(400).json({ error: "No transcript provided." });
 
-    const prompt = `You are a French oral exam coach. Here is a transcription of a French oral exam audio:\n\n"${transcript}"\n\nWrite a study guide using EXACTLY these headers (in bold with double asterisks):\n\n**WORD-FOR-WORD TRANSLATION**\n[Translate the entire French transcript word-for-word into English, keeping the same structure and sentences]\n\n**KEY VOCABULARY**\n[8-10 important words/phrases, format: French word - English meaning]\n\n**GRAMMAR POINTS**\n[3-4 grammar structures used in the audio]\n\n**SAMPLE QUESTIONS & MODEL ANSWERS**\n[3 exam questions with model French answers + English translation]\n\n**TIPS TO ACE THIS TOPIC**\n[3-4 practical tips for the oral exam]\n\nIMPORTANT: Use EXACTLY the header format shown above with **double asterisks**. Do not use ## markdown headers.`;
+    // FIXED: very explicit about format — bold asterisks ONLY, no ## headers
+    const prompt = `You are a French oral exam coach. Here is a transcription of a French oral exam audio:
 
-    let guide = "", lastError = "";
+"${transcript}"
 
+Write a complete study guide using EXACTLY these 5 section headers, formatted with double asterisks (**) like shown:
+
+**WORD-FOR-WORD TRANSLATION**
+Translate the entire French transcript into English word-for-word, keeping the same sentence structure.
+
+**KEY VOCABULARY**
+List 8-10 important French words/phrases from the audio with their English meanings. Format: French word - English meaning
+
+**GRAMMAR POINTS**
+Explain 3-4 grammar structures that appear in the audio and are useful for the exam.
+
+**SAMPLE QUESTIONS & MODEL ANSWERS**
+Write 3 exam questions about the audio topic, each with a model French answer and English translation.
+
+**TIPS TO ACE THIS TOPIC**
+Give 3-4 practical tips for performing well on this topic in the oral exam.
+
+CRITICAL FORMATTING RULES:
+- Use EXACTLY **WORD-FOR-WORD TRANSLATION**, **KEY VOCABULARY**, **GRAMMAR POINTS**, **SAMPLE QUESTIONS & MODEL ANSWERS**, **TIPS TO ACE THIS TOPIC** as headers
+- Each header must start with ** and end with ** on its own line
+- Do NOT use ## or ### markdown headings
+- Do NOT use any other heading format`;
+
+    let guide = "";
+    let lastError = "";
+
+    // Try Gemini first
     for (const model of ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]) {
       if (guide) break;
       try {
@@ -535,18 +588,27 @@ app.post("/study-guide", async (req, res) => {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               contents: [{ parts: [{ text: prompt }] }],
-              generationConfig: { maxOutputTokens: 1200, temperature: 0.7 },
+              generationConfig: { maxOutputTokens: 1500, temperature: 0.7 },
             }),
           }
         );
         const data = await r.json();
         if (r.ok && data?.candidates?.[0]?.content?.parts?.[0]?.text) {
           guide = data.candidates[0].content.parts[0].text;
-          console.log(`[STUDY-GUIDE] ✅ Gemini ${model}`);
-        } else { lastError = JSON.stringify(data).slice(0, 200); }
-      } catch (e) { lastError = e.message; }
+          console.log(`[STUDY-GUIDE] ✅ Gemini ${model} — ${guide.length} chars`);
+          // Debug: log first 300 chars to verify header format
+          console.log(`[STUDY-GUIDE] Preview: ${guide.slice(0, 300)}`);
+        } else {
+          lastError = JSON.stringify(data).slice(0, 200);
+          console.warn(`[STUDY-GUIDE] Gemini ${model} failed: ${lastError}`);
+        }
+      } catch (e) {
+        lastError = e.message;
+        console.warn(`[STUDY-GUIDE] Gemini ${model} error: ${e.message}`);
+      }
     }
 
+    // Fall back to Groq
     if (!guide) {
       for (const model of ["llama-3.3-70b-versatile", "llama3-8b-8192", "llama-3.1-8b-instant"]) {
         if (guide) break;
@@ -554,30 +616,41 @@ app.post("/study-guide", async (req, res) => {
           const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
             method: "POST",
             headers: { Authorization: `Bearer ${GROQ_KEY}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ model, max_tokens: 1200, messages: [{ role: "user", content: prompt }] }),
+            body: JSON.stringify({ model, max_tokens: 1500, messages: [{ role: "user", content: prompt }] }),
           });
           const data = await r.json();
           if (r.ok && data?.choices?.[0]?.message?.content) {
             guide = data.choices[0].message.content;
-            console.log(`[STUDY-GUIDE] ✅ Groq ${model}`);
+            console.log(`[STUDY-GUIDE] ✅ Groq ${model} — ${guide.length} chars`);
           } else {
             if (r.status === 429) {
+              console.log(`[STUDY-GUIDE] Groq rate limit, waiting 10s...`);
               await new Promise(r => setTimeout(r, 10000));
               const r2 = await fetch("https://api.groq.com/openai/v1/chat/completions", {
                 method: "POST",
                 headers: { Authorization: `Bearer ${GROQ_KEY}`, "Content-Type": "application/json" },
-                body: JSON.stringify({ model, max_tokens: 1200, messages: [{ role: "user", content: prompt }] }),
+                body: JSON.stringify({ model, max_tokens: 1500, messages: [{ role: "user", content: prompt }] }),
               });
               const d2 = await r2.json();
-              if (r2.ok && d2?.choices?.[0]?.message?.content) { guide = d2.choices[0].message.content; }
+              if (r2.ok && d2?.choices?.[0]?.message?.content) {
+                guide = d2.choices[0].message.content;
+                console.log(`[STUDY-GUIDE] ✅ Groq ${model} (retry) — ${guide.length} chars`);
+              }
             }
             lastError = JSON.stringify(data).slice(0, 200);
           }
-        } catch (e) { lastError = e.message; }
+        } catch (e) {
+          lastError = e.message;
+          console.warn(`[STUDY-GUIDE] Groq ${model} error: ${e.message}`);
+        }
       }
     }
 
-    if (!guide) return res.status(502).json({ error: "Could not generate study guide. Please try again." });
+    if (!guide) {
+      console.error(`[STUDY-GUIDE] ❌ All models failed. Last error: ${lastError}`);
+      return res.status(502).json({ error: "Could not generate study guide. Please try again." });
+    }
+
     res.json({ guide });
 
   } catch (e) {
