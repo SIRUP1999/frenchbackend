@@ -80,31 +80,6 @@ function secondsUntilMidnight() {
 function generateToken() { return crypto.randomBytes(16).toString("hex"); }
 
 /* ═══════════════════════════════════════════════════
-   LIVE USERS TRACKING
-   ─────────────────────────────────────────────────
-   Each session heartbeat sets a Redis key with a
-   2-minute TTL. Counting keys with prefix
-   "fom:live:" gives approximate concurrent users.
-   ═══════════════════════════════════════════════════ */
-async function heartbeatSession(token) {
-  if (!token || token.length !== 32) return;
-  const key = `fom:live:${token}`;
-  await redis("SET", key, "1");
-  await redis("EXPIRE", key, 120); // 2 minutes TTL
-}
-
-async function getLiveUserCount() {
-  try {
-    // SCAN for all fom:live:* keys to count active sessions
-    const result = await redis("KEYS", "fom:live:*");
-    if (Array.isArray(result)) return result.length;
-    return 0;
-  } catch(e) {
-    return 0;
-  }
-}
-
-/* ═══════════════════════════════════════════════════
    Paystack helpers
    ═══════════════════════════════════════════════════ */
 async function createPayment(email, amount, metadata, callbackUrl) {
@@ -207,6 +182,7 @@ function getAudioMime(name, mime) {
    Transcription with retry
    ═══════════════════════════════════════════════════ */
 async function transcribeWithRetry(buf, name, mime, language, retries = 3) {
+  // language is the Whisper language code e.g. "fr", "es", "ar", "pt"
   const langCode = language || "fr";
 
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -258,7 +234,9 @@ async function transcribeWithRetry(buf, name, mime, language, retries = 3) {
 }
 
 /* ═══════════════════════════════════════════════════
-   STUDY GUIDE PROMPT
+   STUDY GUIDE PROMPT — builds language-aware prompt
+   NOTE: Section headers MUST stay in English so the
+   frontend parseGuide() function can find them.
    ═══════════════════════════════════════════════════ */
 function buildStudyGuidePrompt(transcript, langInfo) {
   const { name, nativeName } = langInfo;
@@ -296,17 +274,6 @@ CRITICAL RULES:
 }
 
 /* ═══════════════════════════════════════════════════
-   MCQ PROMPT — special mode for MCQ generation
-   The frontend sends the MCQ prompt as the transcript
-   with _mcq_mode: true. We just pass it through to
-   the AI models as a direct prompt.
-   ═══════════════════════════════════════════════════ */
-function isMCQMode(transcript) {
-  // MCQ mode: the "transcript" IS the full prompt (starts with "You are a")
-  return transcript && transcript.startsWith("You are a") && transcript.includes("multiple-choice questions");
-}
-
-/* ═══════════════════════════════════════════════════
    Middleware
    ═══════════════════════════════════════════════════ */
 const stats   = { visits: 0 };
@@ -331,28 +298,18 @@ app.get("/", (req, res) => {
 app.get("/session", async (req, res) => {
   const existing = req.headers["x-session-token"];
   if (existing && existing.length === 32) {
-    // Heartbeat — mark this session as live
-    heartbeatSession(existing).catch(() => {});
-
-    const [used, extra, liveCount] = await Promise.all([
+    const [used, extra] = await Promise.all([
       getUsageByToken(existing),
-      getExtraTranscriptions(existing),
-      getLiveUserCount()
+      getExtraTranscriptions(existing)
     ]);
     return res.json({
       token: existing, used, limit: FREE_DAILY_LIMIT,
       remaining: Math.max(0, FREE_DAILY_LIMIT - used),
-      extra_transcriptions: extra,
-      live_users: liveCount
+      extra_transcriptions: extra
     });
   }
   const token = generateToken();
-
-  // Heartbeat for new token too
-  heartbeatSession(token).catch(() => {});
-  const liveCount = await getLiveUserCount();
-
-  res.json({ token, used: 0, limit: FREE_DAILY_LIMIT, remaining: FREE_DAILY_LIMIT, extra_transcriptions: 0, live_users: liveCount });
+  res.json({ token, used: 0, limit: FREE_DAILY_LIMIT, remaining: FREE_DAILY_LIMIT, extra_transcriptions: 0 });
 });
 
 app.get("/usage", async (req, res) => {
@@ -364,32 +321,16 @@ app.get("/usage", async (req, res) => {
   res.json({ used, limit: FREE_DAILY_LIMIT, remaining: Math.max(0, FREE_DAILY_LIMIT - used) });
 });
 
-/* ─────────────────────────────────────────────────
-   /live  — returns current active user count
-   Called by frontend every 30 seconds
-   ───────────────────────────────────────────────── */
-app.get("/live", async (req, res) => {
-  // Also heartbeat if session token provided
-  const token = req.headers["x-session-token"];
-  if (token && token.length === 32) {
-    heartbeatSession(token).catch(() => {});
-  }
-  const liveCount = await getLiveUserCount();
-  res.json({ live_users: liveCount, count: liveCount });
-});
-
 app.get("/stats", async (req, res) => {
   if (req.query.password !== STATS_PASSWORD) return res.status(403).json({ error: "Access denied." });
-  const [total, today, liveCount] = await Promise.all([
+  const [total, today] = await Promise.all([
     redis("GET", "fom:stats:total"),
-    redis("GET", `fom:stats:day:${todayStr()}`),
-    getLiveUserCount()
+    redis("GET", `fom:stats:day:${todayStr()}`)
   ]);
   res.json({
     "🌍 Oral Master Stats": "━━━━━━━━━━━━━━━━━━",
     total_transcriptions_ever: parseInt(total || 0),
     today_transcriptions:      parseInt(today || 0),
-    live_users_right_now:      liveCount,
     session_visits:            stats.visits,
     free_limit_per_user:       FREE_DAILY_LIMIT,
     supported_languages:       Object.keys(SUPPORTED_LANGUAGES),
@@ -444,7 +385,7 @@ app.post("/verify-payment", async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════════════
-   /transcribe
+   /transcribe — now accepts `language` form field
    ═══════════════════════════════════════════════════ */
 app.post("/transcribe", (req, res, next) => {
   upload.single("file")(req, res, err => {
@@ -458,12 +399,10 @@ async function transcribeHandler(req, res) {
   const token   = req.headers["x-session-token"];
   const isOwner = OWNER_SECRET && (req.headers["x-owner-secret"] || "") === OWNER_SECRET;
 
+  // Read language from form data (sent alongside the file)
   const langCode = (req.body && req.body.language) ? req.body.language.toLowerCase().trim() : "fr";
   const langInfo = resolveLanguage(langCode);
   console.log(`[TRANSCRIBE] language=${langCode} (${langInfo.name})`);
-
-  // Heartbeat
-  if (token && token.length === 32) heartbeatSession(token).catch(() => {});
 
   try {
     const useToken = !!(token && token.length === 32);
@@ -484,6 +423,7 @@ async function transcribeHandler(req, res) {
     if (!req.file)             return res.status(400).json({ error: "No audio file received." });
     if (req.file.size < 1000)  return res.status(400).json({ error: "Audio file is too small." });
 
+    // Pass language code to Whisper
     const result = await transcribeWithRetry(req.file.buffer, req.file.originalname, req.file.mimetype, langInfo.whisper);
     if (!result.ok) return res.status(502).json({ error: result.error });
 
@@ -519,25 +459,16 @@ async function transcribeHandler(req, res) {
 }
 
 /* ═══════════════════════════════════════════════════
-   /study-guide — handles both study guide AND MCQ
+   /study-guide — now accepts `language` in body
    ═══════════════════════════════════════════════════ */
 app.post("/study-guide", async (req, res) => {
   try {
-    const { transcript, language, _mcq_mode } = req.body;
+    const { transcript, language } = req.body;
     if (!transcript?.trim()) return res.status(400).json({ error: "No transcript provided." });
 
-    // Heartbeat
-    const token = req.headers["x-session-token"];
-    if (token && token.length === 32) heartbeatSession(token).catch(() => {});
-
     const langInfo = resolveLanguage(language || "fr");
-
-    // For MCQ mode, the transcript IS the full prompt already
-    const prompt = isMCQMode(transcript)
-      ? transcript
-      : buildStudyGuidePrompt(transcript, langInfo);
-
-    console.log(`[STUDY-GUIDE] language=${langInfo.name} mcq=${!!_mcq_mode}`);
+    const prompt   = buildStudyGuidePrompt(transcript, langInfo);
+    console.log(`[STUDY-GUIDE] language=${langInfo.name}`);
 
     let guide = "", lastError = "";
 
