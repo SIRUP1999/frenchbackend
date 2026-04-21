@@ -34,6 +34,21 @@ app.use(cors({ origin: "*" }));
 app.use(express.json());
 
 /* ═══════════════════════════════════════════════════
+   SUPPORTED LANGUAGES
+   ═══════════════════════════════════════════════════ */
+const SUPPORTED_LANGUAGES = {
+  fr: { name: "French",     whisper: "fr", nativeName: "Français"  },
+  es: { name: "Spanish",    whisper: "es", nativeName: "Español"   },
+  ar: { name: "Arabic",     whisper: "ar", nativeName: "العربية"   },
+  pt: { name: "Portuguese", whisper: "pt", nativeName: "Português" },
+};
+
+function resolveLanguage(lang) {
+  const key = (lang || "fr").toLowerCase().trim();
+  return SUPPORTED_LANGUAGES[key] || SUPPORTED_LANGUAGES["fr"];
+}
+
+/* ═══════════════════════════════════════════════════
    Upstash Redis helper
    ═══════════════════════════════════════════════════ */
 async function redis(...args) {
@@ -108,7 +123,7 @@ async function addExtraTranscriptions(token, count) {
   const current = await redis("GET", key) || 0;
   const total   = parseInt(current) + count;
   await redis("SET",    key, total);
-  await redis("EXPIRE", key, 60 * 60 * 24 * 30); // 30 days
+  await redis("EXPIRE", key, 60 * 60 * 24 * 30);
   console.log(`[EXTRA] +${count} → ${token.slice(0,8)}… total=${total}`);
   return total;
 }
@@ -124,7 +139,7 @@ async function useExtraTranscription(token) {
 }
 
 /* ═══════════════════════════════════════════════════
-   Usage tracking (token-based + IP fallback)
+   Usage tracking
    ═══════════════════════════════════════════════════ */
 const tokenKey = t  => `fom:${t}:${todayStr()}`;
 const ipKey    = ip => `fom:ip:${ip.replace(/[^a-zA-Z0-9]/g,"")}:${todayStr()}`;
@@ -166,14 +181,17 @@ function getAudioMime(name, mime) {
 /* ═══════════════════════════════════════════════════
    Transcription with retry
    ═══════════════════════════════════════════════════ */
-async function transcribeWithRetry(buf, name, mime, retries = 3) {
+async function transcribeWithRetry(buf, name, mime, language, retries = 3) {
+  // language is the Whisper language code e.g. "fr", "es", "ar", "pt"
+  const langCode = language || "fr";
+
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const safeMime = getAudioMime(name, mime);
       const form     = new FormData();
       form.append("file",            buf,  { filename: name || "audio.mp3", contentType: safeMime });
       form.append("model",           "whisper-large-v3-turbo");
-      form.append("language",        "fr");
+      form.append("language",        langCode);
       form.append("response_format", "text");
 
       const res  = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
@@ -182,7 +200,7 @@ async function transcribeWithRetry(buf, name, mime, retries = 3) {
         body:    form,
       });
       const body = await res.text();
-      console.log(`[TRANSCRIBE] Groq: ${res.status} | ${body.slice(0,150)}`);
+      console.log(`[TRANSCRIBE] Groq (${langCode}): ${res.status} | ${body.slice(0,150)}`);
 
       if (res.status === 429) {
         await new Promise(r => setTimeout(r, attempt * 10000));
@@ -190,11 +208,10 @@ async function transcribeWithRetry(buf, name, mime, retries = 3) {
       }
       if (res.status === 400) {
         if (attempt === 1) {
-          // Retry with forced mp3 mime type — some files have wrong extension/mime
           const f2 = new FormData();
           f2.append("file",            buf, { filename: "audio.mp3", contentType: "audio/mpeg" });
           f2.append("model",           "whisper-large-v3-turbo");
-          f2.append("language",        "fr");
+          f2.append("language",        langCode);
           f2.append("response_format", "text");
           const r2  = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
             method: "POST", headers: { Authorization: `Bearer ${GROQ_KEY}`, ...f2.getHeaders() }, body: f2,
@@ -217,18 +234,52 @@ async function transcribeWithRetry(buf, name, mime, retries = 3) {
 }
 
 /* ═══════════════════════════════════════════════════
+   STUDY GUIDE PROMPT — builds language-aware prompt
+   NOTE: Section headers MUST stay in English so the
+   frontend parseGuide() function can find them.
+   ═══════════════════════════════════════════════════ */
+function buildStudyGuidePrompt(transcript, langInfo) {
+  const { name, nativeName } = langInfo;
+
+  return `You are a ${name} oral exam coach. Here is a transcription of a ${name} oral exam audio:
+
+"${transcript}"
+
+Write a complete study guide using EXACTLY these 5 section headers formatted with double asterisks.
+Do NOT use ## markdown headings. Do NOT add any text before the first header.
+
+**WORD-FOR-WORD TRANSLATION**
+Translate the entire ${name} transcript into English, sentence by sentence, word for word. Include every sentence — do not skip any.
+
+**KEY VOCABULARY**
+List 8-10 important ${name} words or phrases from the audio with their English meanings.
+Format: ${name} word - English meaning
+
+**GRAMMAR POINTS**
+Explain 3-4 important grammar structures from the audio that students should know for their oral exam.
+
+**SAMPLE QUESTIONS & MODEL ANSWERS**
+Write 3 exam-style questions about this audio topic. For each question provide:
+- The question in ${name}
+- A model answer in ${name} (2-3 sentences)
+- An English translation of the model answer
+
+**TIPS TO ACE THIS TOPIC**
+Give 3-4 practical, specific tips for performing well on this topic in a ${name} oral exam.
+
+CRITICAL RULES:
+1. Use EXACTLY the 5 headers above with ** on both sides, in UPPERCASE.
+2. Complete ALL 5 sections fully — do not stop early or truncate any section.
+3. Do NOT add any preamble or text before **WORD-FOR-WORD TRANSLATION**.`;
+}
+
+/* ═══════════════════════════════════════════════════
    Middleware
    ═══════════════════════════════════════════════════ */
 const stats   = { visits: 0 };
 const limiter = rateLimit({ windowMs: 60000, max: 30, message: { error: "Too many requests." } });
 app.use(limiter);
 
-/*
-  ✅ BUG 14 FIX: Multer error handler.
-  Without this, uploading a file > 25 MB throws an unhandled MulterError
-  and the request dies with a cryptic 500 error and no useful message.
-  Now it returns a clean 413 with an explanation.
-*/
 function handleMulterError(err, req, res, next) {
   if (err && err.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({ error: "File too large. Maximum audio size is 25 MB." });
@@ -241,7 +292,7 @@ function handleMulterError(err, req, res, next) {
    ═══════════════════════════════════════════════════ */
 app.get("/", (req, res) => {
   stats.visits++;
-  res.json({ status: "French Oral Master API 🇫🇷" });
+  res.json({ status: "French Oral Master API 🇫🇷🇪🇸🇸🇦🇧🇷", supportedLanguages: Object.keys(SUPPORTED_LANGUAGES) });
 });
 
 app.get("/session", async (req, res) => {
@@ -277,11 +328,12 @@ app.get("/stats", async (req, res) => {
     redis("GET", `fom:stats:day:${todayStr()}`)
   ]);
   res.json({
-    "🇫🇷 French Oral Master Stats": "━━━━━━━━━━━━━━━━━━",
+    "🌍 Oral Master Stats": "━━━━━━━━━━━━━━━━━━",
     total_transcriptions_ever: parseInt(total || 0),
     today_transcriptions:      parseInt(today || 0),
     session_visits:            stats.visits,
     free_limit_per_user:       FREE_DAILY_LIMIT,
+    supported_languages:       Object.keys(SUPPORTED_LANGUAGES),
     server_time:               new Date().toISOString(),
   });
 });
@@ -293,11 +345,6 @@ app.post("/create-payment", async (req, res) => {
     return res.status(400).json({ error: "Missing email, pkg, or session token" });
   }
 
-  /*
-    ✅ BUG 15 FIX: Package transcription counts are now authoritative here.
-    Frontend modal HTML must match these values exactly.
-    small=5, medium=10, large=15
-  */
   const packages = {
     small:  { price: 5,  transcriptions: 5,  name: "5 Extra Transcriptions"  },
     medium: { price: 12, transcriptions: 10, name: "10 Extra Transcriptions" },
@@ -338,8 +385,7 @@ app.post("/verify-payment", async (req, res) => {
 });
 
 /* ═══════════════════════════════════════════════════
-   /transcribe
-   ✅ BUG 14 FIX: multer error is caught and returns 413.
+   /transcribe — now accepts `language` form field
    ═══════════════════════════════════════════════════ */
 app.post("/transcribe", (req, res, next) => {
   upload.single("file")(req, res, err => {
@@ -352,6 +398,11 @@ async function transcribeHandler(req, res) {
   const ip      = getIP(req);
   const token   = req.headers["x-session-token"];
   const isOwner = OWNER_SECRET && (req.headers["x-owner-secret"] || "") === OWNER_SECRET;
+
+  // Read language from form data (sent alongside the file)
+  const langCode = (req.body && req.body.language) ? req.body.language.toLowerCase().trim() : "fr";
+  const langInfo = resolveLanguage(langCode);
+  console.log(`[TRANSCRIBE] language=${langCode} (${langInfo.name})`);
 
   try {
     const useToken = !!(token && token.length === 32);
@@ -372,7 +423,8 @@ async function transcribeHandler(req, res) {
     if (!req.file)             return res.status(400).json({ error: "No audio file received." });
     if (req.file.size < 1000)  return res.status(400).json({ error: "Audio file is too small." });
 
-    const result = await transcribeWithRetry(req.file.buffer, req.file.originalname, req.file.mimetype);
+    // Pass language code to Whisper
+    const result = await transcribeWithRetry(req.file.buffer, req.file.originalname, req.file.mimetype, langInfo.whisper);
     if (!result.ok) return res.status(502).json({ error: result.error });
 
     let used = currentUsage;
@@ -389,10 +441,11 @@ async function transcribeHandler(req, res) {
     redis("INCR", dayKey).then(v => { if (v === 1) redis("EXPIRE", dayKey, 60 * 60 * 24 * 7); });
 
     const finalExtra = useToken ? await getExtraTranscriptions(token) : 0;
-    console.log(`[TRANSCRIBE] ✅ usage=${used}/${FREE_DAILY_LIMIT} extra=${finalExtra}`);
+    console.log(`[TRANSCRIBE] ✅ lang=${langCode} usage=${used}/${FREE_DAILY_LIMIT} extra=${finalExtra}`);
 
     res.json({
       transcript: result.transcript,
+      language:   langCode,
       usage: {
         used, limit: FREE_DAILY_LIMIT,
         remaining: Math.max(0, FREE_DAILY_LIMIT - used),
@@ -405,64 +458,17 @@ async function transcribeHandler(req, res) {
   }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
-   /study-guide
-   ✅ BUG 10 FIX: maxOutputTokens raised from 1500 → 2500.
-      At 1500, the Gemini response was truncated mid-way through
-      WORD-FOR-WORD TRANSLATION (the longest section), so the remaining
-      section headers were never generated and parseGuide() found nothing.
-
-   ✅ BUG 11 FIX: max_tokens raised from 1500 → 2500 on ALL Groq fallbacks.
-
-   ✅ BUG 12 FIX: AbortSignal.timeout(30000) added to every Gemini and
-      Groq fetch call. Without this, a hanging API call stalls the entire
-      /study-guide endpoint indefinitely until Node's socket timeout.
-
-   ✅ BUG 13 FIX: After a successful Groq 429 retry, code now uses
-      `continue` to move to the next loop iteration cleanly. Previously
-      it fell through to `lastError = JSON.stringify(data)` on the
-      ORIGINAL failed request, which silently overwrote the success.
-   ═══════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════
+   /study-guide — now accepts `language` in body
+   ═══════════════════════════════════════════════════ */
 app.post("/study-guide", async (req, res) => {
   try {
-    const { transcript } = req.body;
+    const { transcript, language } = req.body;
     if (!transcript?.trim()) return res.status(400).json({ error: "No transcript provided." });
 
-    /*
-      CRITICAL: These section headers MUST match exactly what parseGuide()
-      searches for in the frontend. They are uppercase and wrapped in **.
-      Do NOT change these headers without updating parseGuide() too.
-    */
-    const prompt = `You are a French oral exam coach. Here is a transcription of a French oral exam audio:
-
-"${transcript}"
-
-Write a complete study guide using EXACTLY these 5 section headers formatted with double asterisks.
-Do NOT use ## markdown headings. Do NOT add any text before the first header.
-
-**WORD-FOR-WORD TRANSLATION**
-Translate the entire French transcript into English, sentence by sentence, word for word. Include every sentence — do not skip any.
-
-**KEY VOCABULARY**
-List 8-10 important French words or phrases from the audio with their English meanings.
-Format: French word - English meaning
-
-**GRAMMAR POINTS**
-Explain 3-4 important grammar structures from the audio that students should know for their oral exam.
-
-**SAMPLE QUESTIONS & MODEL ANSWERS**
-Write 3 exam-style questions about this audio topic. For each question provide:
-- The question in French
-- A model answer in French (2-3 sentences)
-- An English translation of the model answer
-
-**TIPS TO ACE THIS TOPIC**
-Give 3-4 practical, specific tips for performing well on this topic in a French oral exam.
-
-CRITICAL RULES:
-1. Use EXACTLY the 5 headers above with ** on both sides, in UPPERCASE.
-2. Complete ALL 5 sections fully — do not stop early or truncate any section.
-3. Do NOT add any preamble or text before **WORD-FOR-WORD TRANSLATION**.`;
+    const langInfo = resolveLanguage(language || "fr");
+    const prompt   = buildStudyGuidePrompt(transcript, langInfo);
+    console.log(`[STUDY-GUIDE] language=${langInfo.name}`);
 
     let guide = "", lastError = "";
 
@@ -477,10 +483,8 @@ CRITICAL RULES:
             headers: { "Content-Type": "application/json" },
             body:    JSON.stringify({
               contents:         [{ parts: [{ text: prompt }] }],
-              /* ✅ BUG 10 FIX: 1500 → 2500 */
               generationConfig: { maxOutputTokens: 2500, temperature: 0.7 }
             }),
-            /* ✅ BUG 12 FIX: timeout added — was missing entirely */
             signal: AbortSignal.timeout(30000)
           }
         );
@@ -488,9 +492,8 @@ CRITICAL RULES:
 
         if (r.ok && data?.candidates?.[0]?.content?.parts?.[0]?.text) {
           guide = data.candidates[0].content.parts[0].text;
-          console.log(`[STUDY-GUIDE] ✅ Gemini ${model}`);
+          console.log(`[STUDY-GUIDE] ✅ Gemini ${model} (${langInfo.name})`);
         } else if (r.status === 429) {
-          // Rate-limited — wait and retry once with the same model
           console.log(`[STUDY-GUIDE] Gemini ${model} rate-limited, waiting 10s…`);
           await new Promise(r => setTimeout(r, 10000));
           const r2   = await fetch(
@@ -527,7 +530,6 @@ CRITICAL RULES:
       for (const model of ["llama-3.3-70b-versatile", "llama3-8b-8192", "llama-3.1-8b-instant"]) {
         if (guide) break;
         try {
-          /* ✅ BUG 11 FIX: 1500 → 2500, ✅ BUG 12 FIX: timeout added */
           const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
             method:  "POST",
             headers: { Authorization: `Bearer ${GROQ_KEY}`, "Content-Type": "application/json" },
@@ -538,8 +540,8 @@ CRITICAL RULES:
 
           if (r.ok && data?.choices?.[0]?.message?.content) {
             guide = data.choices[0].message.content;
-            console.log(`[STUDY-GUIDE] ✅ Groq ${model}`);
-            continue; // got the guide — break on next iteration
+            console.log(`[STUDY-GUIDE] ✅ Groq ${model} (${langInfo.name})`);
+            continue;
           }
 
           if (r.status === 429) {
@@ -555,13 +557,6 @@ CRITICAL RULES:
             if (r2.ok && d2?.choices?.[0]?.message?.content) {
               guide = d2.choices[0].message.content;
               console.log(`[STUDY-GUIDE] ✅ Groq ${model} (retry after 429)`);
-              /*
-                ✅ BUG 13 FIX: continue here, not fall-through.
-                Old code fell through to `lastError = JSON.stringify(data)`
-                which used `data` from the ORIGINAL failed request, not the retry.
-                This made the guide variable get overwritten with an error on the
-                next loop check. Now we continue cleanly after a successful retry.
-              */
               continue;
             }
             lastError = JSON.stringify(d2).slice(0, 200);
@@ -582,7 +577,7 @@ CRITICAL RULES:
       return res.status(502).json({ error: "Could not generate study guide. Please try again in a moment." });
     }
 
-    res.json({ guide });
+    res.json({ guide, language: langInfo.name });
 
   } catch(e) {
     console.error(`[STUDY-GUIDE] ❌ ${e.message}`);
@@ -591,7 +586,7 @@ CRITICAL RULES:
 });
 
 /* ═══════════════════════════════════════════════════
-   Start server + keepalive ping (prevents Render sleep)
+   Start server + keepalive ping
    ═══════════════════════════════════════════════════ */
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
